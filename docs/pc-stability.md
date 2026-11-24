@@ -14,7 +14,9 @@ title is playable, renders correctly, or survives world loading.
    submission. Imported from Slaktarn700's `6f732b6`, with authorship
    preserved. A new synthetic regression copies and clears a descriptor
    directly in write-watched memory, without invoking a descriptor-copy
-   API, and checks repeated host synchronization.
+   API, and checks repeated host synchronization. A follow-up moves
+   synchronization after deferred command-list copies and under the host
+   submission lock; the regression also covers a deferred descriptor copy.
 3. The fallback presentation window fits its client and caption inside
    the primary desktop work area. The swap-chain/render-target size is
    unchanged. Aspect-ratio tests cover small desktops and portrait and
@@ -32,6 +34,10 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo xtask policy
 cargo build --profile diag -p victory --features diagnostics --locked
 ```
+
+Use `victory shader-info <files> --hash <runtime-hash> --disasm` to locate
+one failing shader's resource metadata. Keep the resulting game-derived
+listing outside the repository.
 
 Diagnostic GPU tests can use WARP by setting `VICTORY_D3D12_WARP=1` in
 that shell before running the diagnostic test command. WARP's supported

@@ -60,6 +60,9 @@ enum Command {
     /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
+        /// Select a container by its 16-digit runtime hash or full BLAKE3.
+        #[arg(long)]
+        hash: Option<String>,
         /// Print one line per container found.
         #[arg(long)]
         verbose: bool,
@@ -143,9 +146,10 @@ fn main() -> Result<()> {
         Command::LibExports { lib, list } => inspect::lib_exports(&lib, list),
         Command::ShaderInfo {
             paths,
+            hash,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+        } => shader::run(paths, hash, verbose || disasm, disasm),
         Command::Translate {
             paths,
             validate,

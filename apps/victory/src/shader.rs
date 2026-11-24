@@ -71,8 +71,16 @@ struct Totals {
     files_with_shaders: usize,
 }
 
-pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
+pub fn run(paths: Vec<PathBuf>, hash: Option<String>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let hash = hash.map(|h| h.to_ascii_lowercase());
+    if let Some(h) = &hash {
+        anyhow::ensure!(
+            matches!(h.len(), 16 | 64) && h.bytes().all(|b| b.is_ascii_hexdigit()),
+            "--hash expects a 16-digit runtime hash or a full 64-digit BLAKE3 hash"
+        );
+    }
+    let verbose = verbose || hash.is_some();
     let mut t = Totals::default();
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
@@ -99,6 +107,13 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };
+                // Raw sources include the rest of their containing file.
+                // Runtime hashes cover exactly the declared container.
+                let size = u32::from_le_bytes(bytes[24..28].try_into().expect("parsed header")) as usize;
+                let digest = blake3::hash(&bytes[..size]).to_hex();
+                if hash.as_ref().is_some_and(|h| !digest.starts_with(h)) {
+                    continue;
+                }
                 found_here += 1;
                 t.containers += 1;
                 let dxil = container.part(FourCC::DXIL);
@@ -169,7 +184,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
                 if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                    println!("{}{} hash={digest}: {line}", path.display(), source.label());
                     for l in &listing {
                         println!("{l}");
                     }
