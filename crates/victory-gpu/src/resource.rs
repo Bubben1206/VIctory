@@ -1163,6 +1163,13 @@ pub(crate) fn placed_epoch() -> u64 {
 pub(crate) struct HeldTexture(This);
 
 #[cfg(windows)]
+impl HeldTexture {
+    pub(crate) fn as_this(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
 impl Drop for HeldTexture {
     fn drop(&mut self) {
         resource_release(self.0);
@@ -1191,15 +1198,19 @@ pub(crate) fn placed_live() -> std::collections::HashSet<usize> {
 }
 
 /// The resource for a texture placed at `address` with the resource
-/// description `desc` (as words), made on first use.
+/// description `desc` (as words), made on first use. Returns a reference
+/// taken under `PLACED_TEXTURES` so eviction cannot free it out from under
+/// the caller.
 #[cfg(windows)]
-pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<HeldTexture> {
     if address == 0 {
         return None;
     }
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(&(r, _)) = map.get(&(address, *desc)) {
-        return Some(r as This);
+        let texture = r as This;
+        object::add_ref(texture);
+        return Some(HeldTexture(texture));
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
@@ -1226,8 +1237,10 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         resource_release(out);
         return None;
     }
+    // One reference stays in `PLACED_TEXTURES`; the caller gets a second.
+    object::add_ref(out);
     map.insert((address, *desc), (out as usize, end));
-    Some(out)
+    Some(HeldTexture(out))
 }
 
 /// Releases placed textures whose backing range overlaps `[start, end)`.

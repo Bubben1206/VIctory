@@ -96,7 +96,8 @@ impl Heap {
         let h = self
             .host
             .get_or_init(|| {
-                host::HostHeap::new(self.samplers(), self.desc.count).map(std::sync::Arc::new)
+                host::HostHeap::new(self.samplers(), self.desc.count, self.start)
+                    .map(std::sync::Arc::new)
             })
             .as_ref()?;
         if !pending.is_empty()
@@ -133,6 +134,7 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     let &(_, _, at) = heaps
         .iter()
+        .rev()
         .find(|&&(start, end, _)| (start..end).contains(&handle))?;
     // SAFETY: registered heaps are live (removed when dropped).
     let heap = unsafe { &*(at as *const Heap) };
@@ -174,6 +176,9 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        if let Some(Some(host)) = self.host.get() {
+            host.detach_title();
+        }
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);

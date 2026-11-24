@@ -68,6 +68,16 @@ struct BounceSlot {
 
 #[derive(Default)]
 struct Bindless {
+    /// Start address of the title's shader-visible descriptor memory (0 when
+    /// detached or in standalone unit tests without a title heap).
+    title_start: u64,
+    /// Last observed `(generation << 32 | view_index)` key per title slot (0
+    /// if no valid tag), so raw byte copies/overwrites into the title heap
+    /// that bypass `mirror()` are detected on bindless sync.
+    seen: Vec<u64>,
+    /// Last `watch::writes` asking number scanned for byte-copied slots (0 =
+    /// initial full scan not yet done).
+    scan_asked: u64,
     /// Active `View::is_buffer()` slots: `slot_index -> (view_index, generation)`.
     slots: BTreeMap<u32, (u32, u32)>,
     /// Of them, those viewing placed textures.
@@ -286,7 +296,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 16;
 
 impl HostHeap {
-    pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+    pub(crate) fn new(sampler: bool, count: u32, title_start: u64) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -344,7 +354,15 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            bindless: Mutex::default(),
+            bindless: Mutex::new(Bindless {
+                title_start: if sampler { 0 } else { title_start },
+                seen: if sampler {
+                    Vec::new()
+                } else {
+                    vec![0; count as usize]
+                },
+                ..Bindless::default()
+            }),
             recording: std::sync::atomic::AtomicBool::new(false),
             record_hint: std::sync::atomic::AtomicBool::new(false),
             record_looked: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -589,7 +607,7 @@ impl HostHeap {
                 }
             }
             if !self.sampler {
-                self.untrack_bindless(index);
+                self.untrack_bindless(index, 0);
             }
             return None;
         };
@@ -615,14 +633,25 @@ impl HostHeap {
                 let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
                 self.track_bindless(index, (i, generation), placed);
             } else {
-                self.untrack_bindless(index);
+                self.untrack_bindless(index, key);
             }
         }
         Some(view)
     }
 
-    fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
+    /// Detaches the title's descriptor memory when its `Heap` is dropped so
+    /// later bindless scans never read freed heap memory.
+    pub(crate) fn detach_title(&self) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        b.title_start = 0;
+    }
+
+    fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
+        let key = u64::from(entry.1) << 32 | u64::from(entry.0);
+        let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = b.seen.get_mut(index as usize) {
+            *seen = key;
+        }
         if b.slots.insert(index, entry) != Some(entry) {
             b.dirty.insert(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
@@ -640,8 +669,11 @@ impl HostHeap {
         }
     }
 
-    fn untrack_bindless(&self, index: u32) {
+    fn untrack_bindless(&self, index: u32, seen_key: u64) {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(seen) = b.seen.get_mut(index as usize) {
+            *seen = seen_key;
+        }
         if b.slots.remove(&index).is_some() {
             b.dirty.insert(index);
             if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
@@ -650,6 +682,158 @@ impl HostHeap {
         }
         if b.placed_set.remove(&index).is_some() {
             b.recorded.remove(&index);
+        }
+    }
+
+    /// Scans title descriptor memory for slots written or overwritten as raw
+    /// bytes (bypassing `mirror()`), using write-watch when the heap's memory
+    /// supports it and scanning all slots otherwise.
+    fn sync_title_slots(&self) {
+        if self.sampler || self.count == 0 {
+            return;
+        }
+        let start = {
+            let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            b.title_start
+        };
+        if start == 0 {
+            return;
+        }
+        const TITLE_SLOT_BYTES: usize = 32;
+        let len = self.count as usize * TITLE_SLOT_BYTES;
+        let end = start as usize + len;
+        let watch = crate::watch::writes(start as usize, end, false);
+
+        let mut cleared = Vec::new();
+        let mut direct = Vec::new();
+        {
+            let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+            if b.title_start != start {
+                return;
+            }
+            let b = &mut *b;
+            let mut check_range = |first: u32, last: u32| {
+                for index in first..last {
+                    let handle = start + u64::from(index) * TITLE_SLOT_BYTES as u64;
+                    // SAFETY: `index < self.count` lies in the live title heap
+                    // (`detach_title` clears `b.title_start` under this lock).
+                    let [tag, vi, generation] =
+                        unsafe { (handle as *const [u32; 3]).read_unaligned() };
+                    let key = if tag == VIEW_TAG && generation != 0 {
+                        u64::from(generation) << 32 | u64::from(vi)
+                    } else {
+                        0
+                    };
+                    let Some(seen) = b.seen.get_mut(index as usize) else {
+                        continue;
+                    };
+                    if *seen == key {
+                        continue;
+                    }
+                    *seen = key;
+                    if key == 0 {
+                        if b.slots.remove(&index).is_some() {
+                            b.dirty.insert(index);
+                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
+                                bounce.active = false;
+                            }
+                        }
+                        if b.placed_set.remove(&index).is_some() {
+                            b.recorded.remove(&index);
+                        }
+                        cleared.push(index);
+                        continue;
+                    }
+                    let Some(view) = view_at(vi, generation) else {
+                        if b.slots.remove(&index).is_some() {
+                            b.dirty.insert(index);
+                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
+                                bounce.active = false;
+                            }
+                        }
+                        if b.placed_set.remove(&index).is_some() {
+                            b.recorded.remove(&index);
+                        }
+                        cleared.push(index);
+                        continue;
+                    };
+                    if view.is_buffer() {
+                        let entry = (vi, generation);
+                        if b.slots.insert(index, entry) != Some(entry) {
+                            b.dirty.insert(index);
+                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
+                                bounce.active = false;
+                            }
+                        }
+                        let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
+                        let changed = if placed {
+                            b.placed_set.insert(index, entry) != Some(entry)
+                        } else {
+                            b.placed_set.remove(&index).is_some()
+                        };
+                        if changed {
+                            b.record_pending.insert(index);
+                            self.record_hint.store(true, Ordering::Release);
+                        }
+                    } else {
+                        if b.slots.remove(&index).is_some() {
+                            b.dirty.insert(index);
+                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
+                                bounce.active = false;
+                            }
+                        }
+                        if b.placed_set.remove(&index).is_some() {
+                            b.recorded.remove(&index);
+                        }
+                        direct.push((index, key, view));
+                    }
+                }
+            };
+
+            match watch {
+                Some((now, pages)) if b.scan_asked != 0 => {
+                    let base = start as usize;
+                    for (page, written_at) in pages {
+                        if written_at <= b.scan_asked {
+                            continue;
+                        }
+                        let page_start = page * crate::watch::PAGE;
+                        let page_end = page_start + crate::watch::PAGE;
+                        let lo = page_start.saturating_sub(base) / TITLE_SLOT_BYTES;
+                        let hi = page_end
+                            .saturating_sub(base)
+                            .div_ceil(TITLE_SLOT_BYTES)
+                            .min(self.count as usize);
+                        if lo < hi {
+                            check_range(lo as u32, hi as u32);
+                        }
+                    }
+                    b.scan_asked = b.scan_asked.max(now);
+                }
+                Some((now, _)) => {
+                    check_range(0, self.count);
+                    b.scan_asked = b.scan_asked.max(now);
+                }
+                None => {
+                    check_range(0, self.count);
+                }
+            }
+        }
+        for index in cleared {
+            self.clear_stale_slot(index);
+        }
+        for (index, key, view) in direct {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] != key {
+                let kept = make(&view, self.cpu(index));
+                if kept.is_none() {
+                    null_for(&view, self.cpu(index));
+                    made[index as usize] = 0;
+                } else {
+                    made[index as usize] = key;
+                }
+                self.keep(index, kept.flatten());
+            }
         }
     }
 
@@ -954,22 +1138,19 @@ impl HostHeap {
                 break;
             }
             match self.resolve_placed(index, vi, generation) {
-                Ok(Some(t)) => {
+                Ok(Some(held)) => {
                     let key = u64::from(generation) << 32 | u64::from(vi);
-                    learnt.push((index, (key, t as usize)));
-                    reached.push(t);
+                    learnt.push((index, (key, held.as_this() as usize)));
+                    reached.push(held);
                 }
                 Ok(None) => {}
                 Err(()) => stale.push(index),
             }
         }
         over.extend(todo.map(|(i, _)| i));
-        reached.extend(due);
-        for texture in reached {
-            // The texture may be evicted meanwhile: a reference keeps it.
-            let Some(_held) = crate::resource::hold_placed(texture) else {
-                continue;
-            };
+        reached.extend(due.into_iter().filter_map(crate::resource::hold_placed));
+        for held in reached {
+            let texture = held.as_this();
             let Some(host_tex) = crate::resource::host_resource(texture) else {
                 continue;
             };
@@ -997,13 +1178,14 @@ impl HostHeap {
 
     /// The placed texture slot `index` views, made in the slot: `Err` if the
     /// view went stale, `None` if it is not a placed texture or cannot be made
-    /// (the slot is then null).
+    /// (the slot is then null). Returns a held reference so eviction cannot
+    /// free it before the caller finishes uploading/transitioning.
     fn resolve_placed(
         &self,
         index: u32,
         vi: u32,
         generation: u32,
-    ) -> Result<Option<crate::object::This>, ()> {
+    ) -> Result<Option<crate::resource::HeldTexture>, ()> {
         use windows::core::Interface;
         let Some(view) = view_at(vi, generation) else {
             self.clear_stale_slot(index);
@@ -1021,18 +1203,18 @@ impl HostHeap {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         }
-        let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view) else {
+        let Some((shader_view, held)) = placed_texture(&view) else {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         };
-        let tex_this = tex_res as crate::object::This;
+        let tex_this = held.as_this();
         let Some(host_tex) = crate::resource::host_resource(tex_this) else {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         };
         let key = u64::from(generation) << 32 | u64::from(vi);
         self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
-        Ok(Some(tex_this))
+        Ok(Some(held))
     }
 
     /// Whether to upload placed texture `texture` (reached through a slot)
@@ -1077,6 +1259,7 @@ impl HostHeap {
         if self.sampler {
             return None;
         }
+        self.sync_title_slots();
         let epochs = (
             VIEWED.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
@@ -1241,12 +1424,11 @@ impl HostHeap {
                     self.set_unmapped_null(index, &view);
                     return Some(slot);
                 }
-                if let Some(shader_view @ View::Shader(tex_res, _)) = placed_texture(&view)
-                    && let Some(host_tex) =
-                        crate::resource::host_resource(tex_res as crate::object::This)
+                if let Some((shader_view, held)) = placed_texture(&view)
+                    && let Some(host_tex) = crate::resource::host_resource(held.as_this())
                 {
                     self.ensure_placed_slot(index, key, &shader_view, host_tex.as_raw());
-                    slot.placed = Some(tex_res);
+                    slot.placed = Some(held.as_this() as usize);
                     slot.retained = Some(host_tex.clone());
                 } else {
                     self.set_unmapped_null(index, &view);
@@ -1650,7 +1832,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
+            if let Some((view, _held)) = placed_texture(view) {
                 return make(&view, at);
             }
             const BUFFER: u32 = 1;
@@ -1678,8 +1860,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 }
 
 /// A shader view of a texture the title placed in memory itself, as a view
-/// of the resource made for that memory (on first use).
-pub(crate) fn placed_texture(view: &View) -> Option<View> {
+/// of the resource made for that memory (on first use), together with a held
+/// reference so concurrent eviction cannot free the resource while in use.
+pub(crate) fn placed_texture(view: &View) -> Option<(View, crate::resource::HeldTexture)> {
     const BUFFER: u32 = 1;
     let View::Placed(false, resource, desc) = view else {
         return None;
@@ -1689,7 +1872,8 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     }
     let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
     let texture = crate::resource::texture_at(address, resource)?;
-    Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+    let shader_view = View::Shader(texture.as_this() as usize, desc[..10].try_into().ok());
+    Some((shader_view, texture))
 }
 
 /// A null view of the kind `view` is, for a slot whose view the host
@@ -1975,7 +2159,7 @@ void main() {
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some(heap) = HostHeap::new(false, 4, 0) else {
             return; // no host GPU
         };
         let a = heap.dynamic(DYNAMIC - 100).unwrap();
@@ -2296,7 +2480,7 @@ void main() {
         let Some(host) = host() else {
             return;
         };
-        let Some(heap) = HostHeap::new(false, 4) else {
+        let Some(heap) = HostHeap::new(false, 4, 0) else {
             return;
         };
         let (a, _) = host.shared_buffer(1 << 16).unwrap();
@@ -2391,5 +2575,101 @@ void main() {
         // Clean up `addr_b` too.
         crate::watch::title_memory_remapped(addr_b as usize, 64 << 10);
         assert!(!crate::resource::has_placed_texture(addr_b, &desc));
+    }
+
+    /// A `HeldTexture` returned by `texture_at` keeps the placed resource
+    /// alive across concurrent eviction by `title_memory_remapped`.
+    #[test]
+    fn placed_texture_handle_survives_eviction() {
+        if host().is_none() {
+            return;
+        }
+        let mem = crate::resource::Memory::zeroed(128 << 10, 64 << 10).unwrap();
+        let addr = mem.address();
+        let desc: [u32; 14] = [
+            3, // TEXTURE2D
+            0,
+            0,
+            0,
+            16,
+            0,
+            16,
+            0x0001_0001,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            1,
+            0,
+            0x100, // LINEAR
+            0,
+            0,
+        ];
+
+        let held = crate::resource::texture_at(addr, &desc).unwrap();
+        assert!(crate::resource::has_placed_texture(addr, &desc));
+
+        // Evict while the caller still holds `held`.
+        crate::watch::title_memory_remapped(addr as usize, 64 << 10);
+        assert!(!crate::resource::has_placed_texture(addr, &desc));
+
+        // The caller's handle still points to a live resource and host texture.
+        let host_tex = crate::resource::host_resource(held.as_this()).unwrap();
+        // SAFETY: `held` keeps the resource (and its host texture) alive.
+        let host_desc = unsafe { host_tex.GetDesc() };
+        assert_eq!((host_desc.Width, host_desc.Height), (16, 16));
+        drop(held);
+    }
+
+    /// Slots filled, overwritten, or cleared by raw byte copies into the
+    /// title heap (bypassing `mirror()`) are detected by `bindless_plan`.
+    #[test]
+    fn bindless_slots_detect_byte_copies_and_overwrites() {
+        if host().is_none() {
+            return;
+        }
+        let (title_heap, base) = make_shader_heap(8);
+        let mem = crate::resource::Memory::zeroed(256 << 10, 64 << 10).unwrap();
+        let addr_a = mem.address();
+        let addr_b = mem.address() + (128 << 10);
+        let mut staging = [0u64; 8]; // two 32-byte staging slots outside the shader heap
+        let stage_a = staging.as_mut_ptr() as u64;
+        let stage_b = stage_a + 32;
+        create_cbv(
+            std::ptr::null(),
+            &[addr_a as u32, (addr_a >> 32) as u32, 256, 0],
+            stage_a,
+        );
+        create_cbv(
+            std::ptr::null(),
+            &[addr_b as u32, (addr_b >> 32) as u32, 256, 0],
+            stage_b,
+        );
+
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let slot1 = base + 32;
+
+        // Raw byte copy into an empty shader-visible slot (no API mirror call).
+        // SAFETY: both `stage_a` and `slot1` are valid 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(stage_a as *const u8, slot1 as *mut u8, 32) };
+        let p1 = host_heap.bindless_plan().unwrap();
+        assert_eq!(p1.reads.len(), 1);
+        assert_eq!(p1.reads[0].1, addr_a as usize);
+        assert_ne!(host_heap.made.lock().unwrap()[1], 0);
+
+        // Raw byte overwrite of an already-tracked slot with another view.
+        // SAFETY: both `stage_b` and `slot1` are valid 32-byte descriptor slots.
+        unsafe { std::ptr::copy_nonoverlapping(stage_b as *const u8, slot1 as *mut u8, 32) };
+        let p2 = host_heap.bindless_plan().unwrap();
+        assert!(!Arc::ptr_eq(&p1, &p2));
+        assert_eq!(p2.reads.len(), 1);
+        assert_eq!(p2.reads[0].1, addr_b as usize);
+
+        // Raw byte zeroing removes the tracked slot and clears its host descriptor.
+        // SAFETY: `slot1` is a valid 32-byte descriptor slot.
+        unsafe { (slot1 as *mut u8).write_bytes(0, 32) };
+        let p3 = host_heap.bindless_plan().unwrap();
+        assert!(p3.reads.is_empty());
+        assert_eq!(host_heap.made.lock().unwrap()[1], 0);
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
     }
 }

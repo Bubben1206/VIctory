@@ -138,21 +138,13 @@ impl Shader {
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage, RootType};
     let host = crate::shader_cache::host_shader(container)?;
-    let dxil_heap = Container::parse(&host.dxil).is_ok_and(|c| {
-        c.part(FourCC::SFI0)
-            .and_then(|p| p.data.get(..8))
-            .is_some_and(|b| {
-                let flags = u64::from_le_bytes(b.try_into().unwrap_or_default());
-                flags & (1 << 32) != 0
-            })
-    });
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
     let writes_memory = programs.is_empty() || programs.iter().any(writes_memory);
-    let (used, native_heap) = programs
+    let (used, resource_heap) = programs
         .into_iter()
         .find(|p| {
             matches!(
@@ -169,7 +161,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     Ok(Translated {
         host,
         used,
-        resource_heap: dxil_heap || native_heap,
+        resource_heap,
         writes_memory,
     })
 }
