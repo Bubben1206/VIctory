@@ -3,26 +3,6 @@
 This branch is experimental. Passing unit tests does not establish that the
 title is playable, renders correctly, or survives world loading.
 
-## Experimental bindless integration
-
-This branch also integrates upstream PR #413 at `51f447b`, preserving its
-seven original commits and authors. It adds submission-time bindless
-buffer/CBV materialization, aligned persistent CBV copies, dirty-slot
-plans, and placed-texture ownership and eviction. The integration retains
-the newer heap-publication ordering, capped-heap dynamic capacity,
-memory-range overflow handling, fallback-window fitting, and descriptor
-synchronization after deferred copies under the submission lock.
-
-The merged WARP diagnostic GPU suite passes 63 tests (one ignored),
-including buffer/CBV/placed-texture reads, refresh across submissions,
-copy-back, descriptor byte copies, and retained-resource lifetime checks.
-This has not yet passed a live world stability test.
-
-Known limits in the proposal remain: slot-making budgets defer some views,
-placed-texture refresh can lag, and bindless UAV ranges above 8 MiB are not
-copied back. It is isolated on `codex/bindless-integration` for testing;
-the smaller `codex/pc-stability` branch remains available for comparison.
-
 ## Changes retained so far
 
 1. Shader heap-handle cache keys include both resource-property words.
