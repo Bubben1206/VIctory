@@ -917,5 +917,15 @@ mod tests {
             resync_title_writes();
             assert_eq!(host.describe_slot(1).as_deref(), Some("null"));
         }
+        // Copies recorded into a command list happen during submission
+        // preparation, after queue entry. Synchronization must follow them.
+        let gpu = crate::host::host().expect("host device");
+        let list = gpu.new_list().expect("copy list");
+        list.defer_copy((address + 16) as *mut u8, address as *const u8, 16);
+        list.close();
+        resync_title_writes();
+        assert_eq!(host.describe_slot(1).as_deref(), Some("null"));
+        gpu.execute(&[&list]);
+        assert_eq!(host.describe_slot(1), expected);
     }
 }

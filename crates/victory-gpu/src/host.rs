@@ -510,6 +510,10 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
+        // Deferred title copies can also write descriptor slots. Mirror
+        // after preparation, under the submission lock, so another queue
+        // cannot overwrite descriptors while this queue's GPU work runs.
+        crate::descriptor::resync_title_writes();
         let prepared = std::time::Instant::now();
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
