@@ -840,4 +840,82 @@ mod tests {
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn cpu_descriptor_copies_are_mirrored_before_submission() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+
+        if crate::host::host().is_none() {
+            return;
+        }
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        struct Allocation(*mut std::ffi::c_void);
+        impl Drop for Allocation {
+            fn drop(&mut self) {
+                // SAFETY: this allocation is owned by the test; its heap
+                // guard is dropped before this guard.
+                unsafe { VirtualFree(self.0, 0, MEM_RELEASE) };
+            }
+        }
+        struct OwnedHeap(This);
+        impl Drop for OwnedHeap {
+            fn drop(&mut self) {
+                release(self.0);
+            }
+        }
+        // SAFETY: a fresh, write-watched allocation of one complete page.
+        let memory = Allocation(unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        });
+        assert!(!memory.0.is_null());
+        let address = memory.0 as u64;
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create(
+                HeapDesc { kind: SAMPLERS, count: 2, flags: SHADER_VISIBLE, nodes: 1 },
+                Placement { address, size: 32 },
+                &mut h,
+            ),
+            S_OK
+        );
+        let owned = OwnedHeap(h);
+        let desc = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            ..Default::default()
+        };
+        // SAFETY: the descriptor is exactly 13 words in the host layout.
+        let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 13]>().read_unaligned() };
+        create_sampler(std::ptr::null(), &words, address);
+        let host = heap(owned.0).host().expect("host sampler heap");
+        let expected = host.describe_slot(0);
+        assert_ne!(expected.as_deref(), Some("null"));
+        assert_eq!(host.describe_slot(1).as_deref(), Some("null"));
+
+        for _ in 0..2 {
+            // SAFETY: two disjoint 16-byte slots in the owned allocation.
+            // No create/copy API informs the host of this CPU copy.
+            unsafe { std::ptr::copy_nonoverlapping(address as *const u8, (address + 16) as *mut u8, 16) };
+            resync_title_writes();
+            assert_eq!(host.describe_slot(1), expected);
+            // SAFETY: clear only the second owned descriptor slot.
+            unsafe { std::ptr::write_bytes((address + 16) as *mut u8, 0, 16) };
+            resync_title_writes();
+            assert_eq!(host.describe_slot(1).as_deref(), Some("null"));
+        }
+    }
 }
