@@ -80,6 +80,31 @@ with it. A separate synthetic GPU test validates the DXIL and reads back
 two distinct values loaded through scalar and vector accesses on WARP.
 Live validation is pending.
 
+## Optional custom GPU progress markers
+
+`codex/gpu-breadcrumbs` adds `VICTORY_GPU_BREADCRUMBS=1` to diagnostics
+builds with DRED enabled. The software adapter returned empty automatic
+breadcrumb history in the live failures. This mode records MARKER_IN and
+MARKER_OUT writes to per-list persistently mapped read-back buffers and
+reports observed reached/completed prefixes with nearby command notes.
+The counters are cleared before each submission, including reused lists.
+
+These are bounds on observed progress, not proof of the faulting command:
+later operations may start before a marker becomes visible. They also do
+not cover a list's separate resource-state prelude. The mode adds resources
+and GPU commands and remains disabled by default. It changes diagnostics,
+not shader or game behavior.
+
+An isolated WARP probe verifies readback, shorter list reuse and preserved
+counter values after explicit removal of its own software device. Run it
+separately with `VICTORY_D3D12_WARP=1`:
+
+```text
+cargo test -p victory-gpu --features diagnostics --locked custom_markers_survive_explicit_warp_device_removal -- --ignored --test-threads=1
+```
+
+Marker ordering follows Microsoft's [WriteBufferImmediate specification](https://microsoft.github.io/DirectX-Specs/d3d/D3D12WriteBufferImmediate.html).
+
 ## Remaining work
 
 The live investigation still encounters device removal. GPU validation

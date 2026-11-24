@@ -17,6 +17,9 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+#[cfg(feature = "diagnostics")]
+mod breadcrumbs;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -309,6 +312,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    #[cfg(feature = "diagnostics")]
+    breadcrumbs: OnceLock<Option<breadcrumbs::Breadcrumbs>>,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -485,6 +490,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                breadcrumbs: OnceLock::new(),
             })
         }
     }
@@ -500,6 +507,12 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        #[cfg(feature = "diagnostics")]
+        for run in runs {
+            if let Some(Some(markers)) = run.breadcrumbs.get() {
+                markers.clear();
+            }
+        }
         let mut batch = Batch::default();
         for list in runs {
             list.run_deferred(&mut batch);
@@ -865,6 +878,10 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         #[cfg(feature = "diagnostics")]
+        if let Some(Some(markers)) = self.breadcrumbs.get() {
+            markers.end(self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32);
+        }
+        #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
@@ -986,6 +1003,13 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+            if breadcrumbs::enabled()
+                && let Some(markers) = self.breadcrumbs.get_or_init(|| {
+                    breadcrumbs::Breadcrumbs::new(&host()?.device, &self.list)
+                }).as_ref()
+            {
+                markers.before(at);
+            }
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
                 unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
@@ -1828,6 +1852,14 @@ fn last_notes(runs: &[&HostList]) -> String {
         let mut text = String::new();
         for (i, r) in runs.iter().enumerate() {
             let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(Some(markers)) = r.breadcrumbs.get() {
+                let (reached, completed) = markers.progress();
+                text.push_str(&format!("; list {i} custom markers: reached {reached}, completed {completed}, total {}", notes.len()));
+                for (at, (note, _)) in notes.iter().enumerate()
+                    .skip(completed.saturating_sub(1) as usize).take(4) {
+                    text.push_str(&format!("; marker vicinity {at}: {note}"));
+                }
+            }
             for (n, _) in notes.iter().rev().take(6).rev() {
                 text.push_str(&format!("; list {i} of {}, of its {}: {n}", runs.len(), notes.len()));
             }
