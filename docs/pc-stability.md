@@ -59,6 +59,27 @@ adapter, not a complete compatibility fallback.
 - Revise or revert a demonstrated regression. Keep independent changes
   in separate commits and compare equivalent run configurations.
 
+## Candidate: scalar and vector buffer consistency
+
+The isolated `codex/heap-buffer-consistency` branch addresses one shader
+annotation inconsistency. An unreflected descriptor loaded directly from
+ResourceHeap could receive a CBV handle for scalar loads and an SRV handle
+for vector loads. A single descriptor cannot match both annotations.
+
+The candidate preserves explicit used-resource metadata. For one direct
+heap descriptor load used by vector buffer operations, scalar loads use
+the same buffer class; a store or atomic makes its reads UAV accesses.
+Known UAV scalar loads also use the raw UAV path. Scalar-only descriptors,
+aliases from different load sites, formats, and structured strides remain
+unresolved. This inference cannot establish the runtime type of every
+unreflected descriptor and is not a complete descriptor-typing solution.
+
+A synthetic regression reproduces mixed CBV/SRV annotations without the
+candidate, checks explicit CBV precedence and UAV consistency, and passes
+with it. A separate synthetic GPU test validates the DXIL and reads back
+two distinct values loaded through scalar and vector accesses on WARP.
+Live validation is pending.
+
 ## Remaining work
 
 The live investigation still encounters device removal. GPU validation

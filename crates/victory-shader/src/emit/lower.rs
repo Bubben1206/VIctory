@@ -2836,7 +2836,7 @@ impl<'a> Lower<'a> {
             .get(&(site, false))
             .copied()
             .ok_or("an untracked descriptor")?;
-        let kind = self.used_kind(src);
+        let kind = self.buffer_kind(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
@@ -2858,8 +2858,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        if matches!(kind, Some(ResourceType::Srv | ResourceType::Uav)) {
+            let u = if kind == Some(ResourceType::Uav) { 0x1000 } else { 0 };
+            let h = self.handle(site, src, false, (11 | u, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -3304,6 +3305,37 @@ impl<'a> Lower<'a> {
                     && u.table_offset_dwords <= dword
             })
             .max_by_key(|u| u.table_offset_dwords)
+    }
+
+    /// Keep scalar and vector accesses through one direct heap descriptor
+    /// consistent. Explicit reflection wins, including vector reads of CBVs.
+    /// For an unreflected heap buffer, use the class already required by its
+    /// vector accesses; scalar-only descriptors remain ambiguous. This does
+    /// not infer formats, strides, or aliases loaded at different sites.
+    fn buffer_kind(&self, src: &Source) -> Option<ResourceType> {
+        if let Some(used) = self.used_kind(src) {
+            return Some(used.kind);
+        }
+        let Source::Loaded { load, .. } = src else { return None };
+        let address = self.scalar.get(load)?;
+        if self.x.native.layout.get(address.param)?.root != RootType::ResourceHeap {
+            return None;
+        }
+        let mut kind = None;
+        for d in &self.x.res.descriptors {
+            if &d.source != src {
+                continue;
+            }
+            let inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            if !matches!(inst.fields, Fields::Buffer { .. }) {
+                continue;
+            }
+            if inst.name().contains("store") || inst.name().contains("atomic") {
+                return Some(ResourceType::Uav);
+            }
+            kind = Some(ResourceType::Srv);
+        }
+        kind
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -6279,7 +6311,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let uav = store || atomic.is_some() || self.buffer_kind(src) == Some(ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some(op) = atomic {
@@ -7015,6 +7047,16 @@ mod tests {
         used: Vec<UsedResource>,
         wave64: bool,
     ) -> Result<Lowered, crate::ShaderError> {
+        lower_with_lds(words, layout, used, wave64, true)
+    }
+
+    fn lower_with_lds(
+        words: &[u32],
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        wave64: bool,
+        lds: bool,
+    ) -> Result<Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
         let native = NativeProgram {
@@ -7025,7 +7067,7 @@ mod tests {
             used,
             io: StageIo::Cs(ComputeIo {
                 // The layout's user SGPRs (at least two), 512 bytes of LDS.
-                rsrc2: 1 << 15 | sgprs.max(2) << 1,
+                rsrc2: u32::from(lds) << 15 | sgprs.max(2) << 1,
                 threads: [1, 1, 1],
             }),
             code,
@@ -7208,6 +7250,78 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn scalar_and_vector_heap_buffer_reads_keep_one_resource_class() {
+        // One descriptor, scalar and vector reads; both results reach LDS.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0404, 0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            0x7E04_0210,             // v_mov_b32 v2, s16
+            0xE030_0000, 0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0
+            0xD834_0000, 0x0000_0200, // ds_write_b32 v0, v2
+            0xD834_0004, 0x0000_0100, // ds_write_b32 v0, v1 offset:4
+            S_ENDPGM,
+        ];
+        let l = lower_with(&words, vec![root(RootType::ResourceHeap, 0, 0)], vec![]).unwrap();
+        assert!(!l.heap_props.is_empty());
+        assert!(l.heap_props.iter().all(|&p| p == (11, 0)), "{:?}", l.heap_props);
+
+        // Explicit CBV reflection overrides the unreflected-buffer rule.
+        let used = vec![UsedResource {
+            kind: ResourceType::Cbv, root: RootType::Table,
+            table_offset_dwords: 0, lower_bound: 0, stride: 0,
+            dwords: 4, user_data: 0, slot: 0,
+        }];
+        let l = lower_with(&words, vec![root(RootType::Table, 0, 0)], used).unwrap();
+        assert!(l.heap_props.iter().all(|&p| p == (13, 0x1_0000)), "{:?}", l.heap_props);
+
+        // A write through that same descriptor makes every access a UAV.
+        let mut written = words[..words.len() - 1].to_vec();
+        written.extend([0xE070_0008, 0x8002_0100, S_ENDPGM]);
+        let l = lower_with(&written, vec![root(RootType::ResourceHeap, 0, 0)], vec![]).unwrap();
+        assert!(l.heap_props.iter().all(|&p| p == (0x100b, 0)), "{:?}", l.heap_props);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn scalar_and_vector_heap_buffer_reads_execute_on_warp() {
+        use crate::emit::host::{Dispatch, Host, Stride, View};
+        use crate::emit::{HostShader, validator};
+        let _one = crate::emit::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // Read two different dwords via scalar and vector operations, then
+        // write both to a separate UAV so readback verifies both paths.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,
+            0xF408_0202, 0xFA00_0000, // input descriptor s[8:11], slot 0
+            0xF408_0302, 0xFA00_0020, // output descriptor s[12:15], slot 1
+            0xF420_0404, 0xFA00_0000, // scalar read at byte 0
+            0x7E04_0210,             // v2 = scalar result
+            0xE030_0004, 0x8002_0100, // vector read at byte 4
+            0xE070_0000, 0x8003_0200, // output[0] = v2
+            0xE070_0004, 0x8003_0100, // output[1] = v1
+            S_ENDPGM,
+        ];
+        let l = lower_with_lds(&words, vec![root(RootType::ResourceHeap, 0, 0)], vec![], false, false).unwrap();
+        let shader = HostShader {
+            stage: HwStage::Cs, dxil: l.dxil, user_data: l.user_data,
+            samplers: l.samplers, static_samplers: vec![],
+            root_cbvs: l.root_cbvs, root_srvs: l.root_srvs,
+        };
+        let mut validator = validator::Validator::load(validator::Validator::default_path().as_deref())
+            .expect("DXIL validator required for this regression");
+        validator.validate(&mut shader.dxil.clone()).unwrap();
+        let host = Host::new(true).expect("WARP SM 6.6 required for this regression");
+        let (signature, pso) = host.compute_pipeline(&shader).unwrap();
+        let data = [0x1234_5678, 0x8765_4321];
+        let result = host.dispatch(&signature, &pso, &Dispatch {
+            roots: vec![],
+            views: &[View::Buffer { data: &data, stride: Stride::Raw }, View::RawUav(2)],
+            samplers: &[], groups: [1, 1, 1],
+        }).unwrap();
+        assert_eq!(result, [data.to_vec()]);
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
