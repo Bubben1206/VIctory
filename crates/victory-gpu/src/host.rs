@@ -1952,13 +1952,37 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        // The fallback window bypasses the HLE's title-window fitting.
+        // Keep the entire client and its caption on the primary work area;
+        // DXGI stretches the unchanged render target into this client.
+        let mut area = RECT::default();
+        let mut x = CW_USEDEFAULT;
+        let mut y = CW_USEDEFAULT;
+        if SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some((&raw mut area).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .is_ok()
+        {
+            let border_w = rect.right - rect.left - width as i32;
+            let border_h = rect.bottom - rect.top - height as i32;
+            let max_w = (area.right - area.left - border_w).max(1) as u32;
+            let max_h = (area.bottom - area.top - border_h).max(1) as u32;
+            let (w, h) = fit_client_size(width, height, max_w, max_h);
+            rect.right = rect.left + w as i32 + border_w;
+            rect.bottom = rect.top + h as i32 + border_h;
+            x = area.left + (area.right - area.left - (rect.right - rect.left)) / 2;
+            y = area.top + (area.bottom - area.top - (rect.bottom - rect.top)) / 2;
+        }
         CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS,
             w!("VIctory"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            x,
+            y,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,
@@ -1966,6 +1990,39 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             Some(instance.into()),
             None,
         )
+    }
+}
+
+/// Shrinks a client to its available space, keeping its aspect ratio and
+/// never enlarging it. Render-target dimensions are independent of this.
+fn fit_client_size(width: u32, height: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if width == 0 || height == 0 || max_w == 0 || max_h == 0 {
+        return (width, height);
+    }
+    if width <= max_w && height <= max_h {
+        return (width, height);
+    }
+    if u64::from(max_w) * u64::from(height)
+        <= u64::from(max_h) * u64::from(width)
+    {
+        (max_w, (u64::from(height) * u64::from(max_w) / u64::from(width)).max(1) as u32)
+    } else {
+        ((u64::from(width) * u64::from(max_h) / u64::from(height)).max(1) as u32, max_h)
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::fit_client_size;
+
+    #[test]
+    fn fallback_client_fits_below_the_taskbar_without_changing_aspect() {
+        assert_eq!(fit_client_size(3840, 2160, 2544, 1353), (2405, 1353));
+        assert_eq!(fit_client_size(3840, 2160, 1904, 1001), (1779, 1001));
+        assert_eq!(fit_client_size(3840, 2160, 1280, 1001), (1280, 720));
+        assert_eq!(fit_client_size(1280, 720, 2544, 1353), (1280, 720));
+        assert_eq!(fit_client_size(2160, 3840, 1280, 720), (405, 720));
+        assert_eq!(fit_client_size(2160, 2160, 1280, 720), (720, 720));
     }
 }
 
