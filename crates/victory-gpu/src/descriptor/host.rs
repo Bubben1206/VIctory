@@ -63,7 +63,8 @@ struct BounceSlot {
     cpu: usize,
     cap: u32,
     resource: ID3D12Resource,
-    active: bool,
+    /// Last `watch::writes` asking number copied into this slice (0 = dirty).
+    copied_at: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -84,16 +85,18 @@ struct Bindless {
     placed_set: BTreeMap<u32, (u32, u32)>,
     /// Placed-texture slots changed since draws last prepared them.
     record_pending: BTreeSet<u32>,
-    /// Persistent 256-byte-aligned bounce slices by `slot_index`.
+    /// Active 256-byte-aligned bounce slices by `slot_index`.
     cbv_bounce: HashMap<u32, BounceSlot>,
+    /// Recycled bounce slices returned when slots are cleared or overwritten.
+    bounce_free: Vec<BounceSlot>,
     /// Backing 256 KiB shared buffers `(resource, cpu_ptr, gpu_va, used_bytes)`.
     bounce_chunks: Vec<(ID3D12Resource, usize, u64, u64)>,
     /// Slots written since the plan was made: only they are made again.
     dirty: BTreeSet<u32>,
     /// What each slot made for bindless access needs at submission.
     uses: BTreeMap<u32, SlotUse>,
-    /// The released-view and placed-texture epochs `uses` was checked at.
-    checked: (u64, u64),
+    /// The released-view, placed-remap, and placed-LRU epochs `uses` was checked at.
+    checked: (u64, u64, u64),
     /// What submissions do for the slots, until they or what they view change.
     plan: Option<Arc<BindlessPlan>>,
     /// Placed-texture slots as last prepared at recording: view key,
@@ -153,8 +156,9 @@ struct SlotUse {
     read: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
     /// What shaders may write through it.
     write: Option<(Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// A misaligned constant buffer: bounce slice, title address, bytes.
-    bounce: Option<(usize, u64, u32)>,
+    /// A misaligned constant buffer: bounce slice, title address, bytes,
+    /// and its last-copied write-watch asking number.
+    bounce: Option<(usize, u64, u32, Arc<AtomicU64>)>,
     /// The host resource it views.
     retained: Option<ID3D12Resource>,
     /// It views a placed texture: the texture's object (0 for none), made
@@ -195,9 +199,10 @@ pub(crate) fn bindless_viewed_changed() {
 /// not a shader writes there. Such ranges stay on the GPU's side.
 const WRITE_CAP: usize = 8 << 20;
 
-/// Gap below which two ranges of one host copy are refreshed as one: the
-/// write-watch answers by 64 KiB page, and fewer, larger askings cost less.
-const READ_GAP: usize = 1 << 20;
+/// Gap below which two ranges of one host copy are refreshed as one: one
+/// 64 KiB write-watch page so adjacent slots share a watch without pulling in
+/// unrelated hot memory between sparse historical slots.
+const READ_GAP: usize = crate::watch::PAGE;
 
 /// What a submission does for a heap's bindless slots, made again only when
 /// the slots or what they view change ([`HostHeap::bindless_plan`]).
@@ -208,8 +213,9 @@ pub(crate) struct BindlessPlan {
     /// The unordered access slots' ranges (up to [`WRITE_CAP`] each), merged:
     /// copied back after a submission whose shaders may write memory.
     pub(crate) writes: Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
-    /// Misaligned constant buffers: bounce slice, title address, bytes.
-    bounces: Vec<(usize, u64, u32)>,
+    /// Misaligned constant buffers sorted by title address:
+    /// `(bounce_cpu, title_address, bytes, last_copied_asking)`.
+    bounces: Vec<(usize, u64, u32, Arc<AtomicU64>)>,
     /// The host resources the slots view, held while a submission runs.
     _retained: Vec<ID3D12Resource>,
 }
@@ -220,20 +226,79 @@ unsafe impl Send for BindlessPlan {}
 unsafe impl Sync for BindlessPlan {}
 
 impl BindlessPlan {
-    /// Copies the misaligned constant buffers into their bounce slices.
+    /// Copies misaligned constant buffers whose backing pages changed since
+    /// their last copy (using write-watch when available, falling back to an
+    /// unconditional copy for non-watched memory).
     pub(crate) fn copy_constants(&self) {
-        for &(cpu, address, len) in &self.bounces {
-            let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Copies, 1);
-                add(C::CopyBytes, u64::from(len));
+        let mut i = 0;
+        while i < self.bounces.len() {
+            let group_start = self.bounces[i].1 as usize;
+            let mut group_end = group_start + self.bounces[i].2 as usize;
+            let mut j = i + 1;
+            while j < self.bounces.len() {
+                let addr = self.bounces[j].1 as usize;
+                let end = addr + self.bounces[j].2 as usize;
+                if addr <= group_end + crate::watch::PAGE {
+                    group_end = group_end.max(end);
+                    j += 1;
+                } else {
+                    break;
+                }
             }
-            crate::host::copy_mapped(cpu as *mut u8, address as *const u8, len as usize, false);
-            let us = started.elapsed().as_micros() as u64;
-            crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
+            let watch = crate::watch::writes(group_start, group_end, false);
+            for (cpu, address, len, copied_at) in &self.bounces[i..j] {
+                let (cpu, address, len) = (*cpu, *address, *len);
+                if len == 0 {
+                    continue;
+                }
+                if let Some((now, pages)) = &watch {
+                    let prev = copied_at.load(Ordering::Relaxed);
+                    let first = address as usize / crate::watch::PAGE;
+                    let last = (address as usize + len as usize - 1) / crate::watch::PAGE;
+                    let dirty = prev == 0
+                        || pages
+                            .iter()
+                            .any(|&(p, w)| (first..=last).contains(&p) && w > prev);
+                    if !dirty {
+                        continue;
+                    }
+                    let started = std::time::Instant::now();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, u64::from(len));
+                    }
+                    crate::host::copy_mapped(
+                        cpu as *mut u8,
+                        address as *const u8,
+                        len as usize,
+                        false,
+                    );
+                    copied_at.store(*now, Ordering::Relaxed);
+                    let us = started.elapsed().as_micros() as u64;
+                    crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                    crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
+                } else {
+                    let started = std::time::Instant::now();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, u64::from(len));
+                    }
+                    crate::host::copy_mapped(
+                        cpu as *mut u8,
+                        address as *const u8,
+                        len as usize,
+                        false,
+                    );
+                    let us = started.elapsed().as_micros() as u64;
+                    crate::host::PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                    crate::host::PREPARING[1].fetch_add(u64::from(len), Ordering::Relaxed);
+                }
+            }
+            i = j;
         }
     }
 }
@@ -646,6 +711,13 @@ impl HostHeap {
         b.title_start = 0;
     }
 
+    fn recycle_bounce(b: &mut Bindless, index: u32) {
+        if let Some(slot) = b.cbv_bounce.remove(&index) {
+            slot.copied_at.store(0, Ordering::Relaxed);
+            b.bounce_free.push(slot);
+        }
+    }
+
     fn track_bindless(&self, index: u32, entry: (u32, u32), placed: bool) {
         let key = u64::from(entry.1) << 32 | u64::from(entry.0);
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
@@ -654,9 +726,7 @@ impl HostHeap {
         }
         if b.slots.insert(index, entry) != Some(entry) {
             b.dirty.insert(index);
-            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                bounce.active = false;
-            }
+            Self::recycle_bounce(&mut b, index);
         }
         let changed = if placed {
             b.placed_set.insert(index, entry) != Some(entry)
@@ -676,9 +746,7 @@ impl HostHeap {
         }
         if b.slots.remove(&index).is_some() {
             b.dirty.insert(index);
-            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                bounce.active = false;
-            }
+            Self::recycle_bounce(&mut b, index);
         }
         if b.placed_set.remove(&index).is_some() {
             b.recorded.remove(&index);
@@ -712,6 +780,7 @@ impl HostHeap {
                 return;
             }
             let b = &mut *b;
+            let prev_asked = b.scan_asked;
             let mut check_range = |first: u32, last: u32| {
                 for index in first..last {
                     let handle = start + u64::from(index) * TITLE_SLOT_BYTES as u64;
@@ -734,9 +803,7 @@ impl HostHeap {
                     if key == 0 {
                         if b.slots.remove(&index).is_some() {
                             b.dirty.insert(index);
-                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                                bounce.active = false;
-                            }
+                            Self::recycle_bounce(b, index);
                         }
                         if b.placed_set.remove(&index).is_some() {
                             b.recorded.remove(&index);
@@ -747,9 +814,7 @@ impl HostHeap {
                     let Some(view) = view_at(vi, generation) else {
                         if b.slots.remove(&index).is_some() {
                             b.dirty.insert(index);
-                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                                bounce.active = false;
-                            }
+                            Self::recycle_bounce(b, index);
                         }
                         if b.placed_set.remove(&index).is_some() {
                             b.recorded.remove(&index);
@@ -761,9 +826,7 @@ impl HostHeap {
                         let entry = (vi, generation);
                         if b.slots.insert(index, entry) != Some(entry) {
                             b.dirty.insert(index);
-                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                                bounce.active = false;
-                            }
+                            Self::recycle_bounce(b, index);
                         }
                         let placed = matches!(&view, View::Placed(false, r, _) if r[0] != 1);
                         let changed = if placed {
@@ -778,9 +841,7 @@ impl HostHeap {
                     } else {
                         if b.slots.remove(&index).is_some() {
                             b.dirty.insert(index);
-                            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                                bounce.active = false;
-                            }
+                            Self::recycle_bounce(b, index);
                         }
                         if b.placed_set.remove(&index).is_some() {
                             b.recorded.remove(&index);
@@ -791,10 +852,10 @@ impl HostHeap {
             };
 
             match watch {
-                Some((now, pages)) if b.scan_asked != 0 => {
+                Some((now, pages)) if prev_asked != 0 => {
                     let base = start as usize;
                     for (page, written_at) in pages {
-                        if written_at <= b.scan_asked {
+                        if written_at <= prev_asked {
                             continue;
                         }
                         let page_start = page * crate::watch::PAGE;
@@ -843,9 +904,7 @@ impl HostHeap {
         b.recorded.remove(&index);
         if entry.is_none_or(|e| b.slots.get(&index) == Some(&e)) {
             b.slots.remove(&index);
-            if let Some(bounce) = b.cbv_bounce.get_mut(&index) {
-                bounce.active = false;
-            }
+            Self::recycle_bounce(b, index);
             b.placed_set.remove(&index);
         }
     }
@@ -920,13 +979,32 @@ impl HostHeap {
         &self,
         index: u32,
         aligned: u32,
-    ) -> Option<(u64, usize, ID3D12Resource, bool)> {
+    ) -> Option<(u64, usize, ID3D12Resource, Arc<AtomicU64>, bool)> {
         let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = b.cbv_bounce.get_mut(&index)
+        if let Some(slot) = b.cbv_bounce.get(&index)
             && slot.cap >= aligned
         {
-            let was_active = std::mem::replace(&mut slot.active, true);
-            return Some((slot.gpu, slot.cpu, slot.resource.clone(), was_active));
+            return Some((
+                slot.gpu,
+                slot.cpu,
+                slot.resource.clone(),
+                slot.copied_at.clone(),
+                true,
+            ));
+        }
+        Self::recycle_bounce(&mut b, index);
+        if let Some(pos) = b.bounce_free.iter().position(|s| s.cap >= aligned) {
+            let slot = b.bounce_free.swap_remove(pos);
+            slot.copied_at.store(0, Ordering::Relaxed);
+            let out = (
+                slot.gpu,
+                slot.cpu,
+                slot.resource.clone(),
+                slot.copied_at.clone(),
+                false,
+            );
+            b.cbv_bounce.insert(index, slot);
+            return Some(out);
         }
         let needed = u64::from(aligned);
         let need_chunk = b
@@ -945,6 +1023,7 @@ impl HostHeap {
         let at = last.3;
         last.3 += needed;
         let (gpu, cpu, res) = (last.2 + at, last.1 + at as usize, last.0.clone());
+        let copied_at = Arc::new(AtomicU64::new(0));
         b.cbv_bounce.insert(
             index,
             BounceSlot {
@@ -952,10 +1031,10 @@ impl HostHeap {
                 cpu,
                 cap: aligned,
                 resource: res.clone(),
-                active: true,
+                copied_at: copied_at.clone(),
             },
         );
-        Some((gpu, cpu, res, false))
+        Some((gpu, cpu, res, copied_at, false))
     }
 
     fn materialize_bindless_cbv(
@@ -965,7 +1044,7 @@ impl HostHeap {
         address: u64,
         capped: u32,
         reads: &mut Vec<(Arc<crate::shadow::Shadow>, usize, usize)>,
-        bounces: &mut Vec<(usize, u64, u32)>,
+        bounces: &mut Vec<(usize, u64, u32, Arc<AtomicU64>)>,
     ) -> Option<ID3D12Resource> {
         let host = host()?;
         let aligned = capped.next_multiple_of(256);
@@ -973,16 +1052,17 @@ impl HostHeap {
             && let Some(shadow) = crate::shadow::find(address, u64::from(capped))
             && shadow.gpu(address).is_multiple_of(256)
         {
-            let bounce_active = self
-                .bindless
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .cbv_bounce
-                .get(&index)
-                .is_some_and(|s| s.active);
+            let had_bounce = {
+                let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
+                let had = b.cbv_bounce.contains_key(&index);
+                if had {
+                    Self::recycle_bounce(&mut b, index);
+                }
+                had
+            };
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-                if made[index as usize] != key || bounce_active {
+                if made[index as usize] != key || had_bounce {
                     let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                         BufferLocation: shadow.gpu(address),
                         SizeInBytes: aligned,
@@ -996,16 +1076,6 @@ impl HostHeap {
                     self.keep(index, Some(shadow.buffer.clone()));
                 }
             }
-            if bounce_active
-                && let Some(slot) = self
-                    .bindless
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .cbv_bounce
-                    .get_mut(&index)
-            {
-                slot.active = false;
-            }
             let len = u64::from(capped).min(shadow.left(address)) as usize;
             if len > 0 {
                 reads.push((shadow.clone(), address as usize, len));
@@ -1013,7 +1083,7 @@ impl HostHeap {
             return Some(shadow.buffer.clone());
         }
 
-        let (gpu, cpu, res, was_active) = self.ensure_cbv_bounce(index, aligned)?;
+        let (gpu, cpu, res, copied_at, was_active) = self.ensure_cbv_bounce(index, aligned)?;
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize] != key || !was_active {
@@ -1030,7 +1100,7 @@ impl HostHeap {
                 self.keep(index, Some(res.clone()));
             }
         }
-        bounces.push((cpu, address, capped));
+        bounces.push((cpu, address, capped, copied_at));
         Some(res)
     }
 
@@ -1199,7 +1269,7 @@ impl HostHeap {
             return Ok(None);
         }
         let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-        if !plausible(address, 1) {
+        if !valid_title_address(address, 1) {
             self.set_unmapped_null(index, &view);
             return Ok(None);
         }
@@ -1263,16 +1333,17 @@ impl HostHeap {
         let epochs = (
             VIEWED.load(Ordering::Acquire),
             crate::resource::placed_epoch(),
+            crate::resource::placed_lru_epoch(),
         );
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
         let frame = crate::queue::presented() + 1;
         let evictions = {
             let b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
-            b.checked.1 != epochs.1 && b.looked[0] != frame
+            (b.checked.1 != epochs.1 || b.checked.2 != epochs.2) && b.looked[0] != frame
         };
         let live = evictions.then(crate::resource::placed_live);
-        let (mut todo, check) = {
+        let (mut todo, check, lru_cleared) = {
             let mut b = self.bindless.lock().unwrap_or_else(|e| e.into_inner());
             let b = &mut *b;
             // Released views and evicted textures are looked for once a frame.
@@ -1290,6 +1361,8 @@ impl HostHeap {
                 return Some(plan.clone());
             }
             let viewed = look && b.checked.0 != epochs.0;
+            let remapped = look && b.checked.1 != epochs.1;
+            let lru_trimmed = look && b.checked.2 != epochs.2;
             let live = if look { live.as_ref() } else { None };
             if look {
                 b.checked = epochs;
@@ -1301,12 +1374,24 @@ impl HostHeap {
             {
                 dirty.insert(i);
             }
-            for (&i, u) in &b.uses {
+            let mut lru_cleared = Vec::new();
+            for (&i, u) in &mut b.uses {
                 let evicted = live
                     .zip(u.placed)
-                    .is_some_and(|(l, t)| !l.contains(&t));
-                if evicted || viewed && u.unmapped {
+                    .is_some_and(|(l, t)| t != 0 && !l.contains(&t));
+                if evicted && !remapped && lru_trimmed {
+                    // LRU-trimmed texture: release retained ref and null out
+                    // the host slot without re-allocating it.
+                    u.placed = None;
+                    u.retained = None;
+                    lru_cleared.push(i);
+                } else if evicted || viewed && u.unmapped {
                     dirty.insert(i);
+                }
+            }
+            if !lru_cleared.is_empty() {
+                for &i in &lru_cleared {
+                    b.recorded.remove(&i);
                 }
             }
             let check: Vec<(u32, (u32, u32))> = if viewed {
@@ -1322,11 +1407,14 @@ impl HostHeap {
                 .into_iter()
                 .map(|i| (i, b.slots.get(&i).copied()))
                 .collect();
-            (todo, check)
+            (todo, check, lru_cleared)
         };
+        let mut made_any = !lru_cleared.is_empty();
+        for idx in lru_cleared {
+            self.clear_stale_slot(idx);
+        }
         todo.extend(stale_views(&check).into_iter().map(|(i, v)| (i, Some(v))));
         let (started, left) = (std::time::Instant::now(), self.budget_left(0));
-        let mut made_any = false;
         let mut todo = todo.into_iter();
         for (index, entry) in todo.by_ref() {
             if started.elapsed().as_micros() as u64 > left {
@@ -1362,9 +1450,10 @@ impl HostHeap {
         for u in b.uses.values() {
             reads.extend(u.read.clone());
             writes.extend(u.write.clone());
-            bounces.extend(u.bounce);
+            bounces.extend(u.bounce.clone());
             retained.extend(u.retained.clone());
         }
+        bounces.sort_unstable_by_key(|&(_, addr, _, _)| addr);
         let plan = Arc::new(BindlessPlan {
             reads: merged(reads, READ_GAP),
             writes: merged(writes, 0),
@@ -1420,7 +1509,7 @@ impl HostHeap {
             View::Placed(false, resource, desc) if resource[0] != 1 => {
                 slot.placed = Some(0);
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                if !plausible(address, 1) {
+                if !valid_title_address(address, 1) {
                     self.set_unmapped_null(index, &view);
                     return Some(slot);
                 }
@@ -2671,5 +2760,82 @@ void main() {
 
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(title_heap), 0);
+    }
+
+    /// Misaligned bindless CBVs on write-watched memory copy only when their
+    /// pages change, and cleared slots recycle their bounce slices.
+    #[test]
+    fn bindless_cbv_bounce_skips_unchanged_watched_pages_and_recycles_slices() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        if host().is_none() {
+            return;
+        }
+        // SAFETY: fresh 64 KiB write-watched allocation, freed before returning.
+        let base_ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base_ptr, 0);
+        let cbv_addr = (base_ptr + 0x30) as u64; // misaligned (not 256B-aligned)
+        // SAFETY: inside the 64 KiB allocation above.
+        unsafe { (cbv_addr as *mut u32).write_volatile(0x1122_3344) };
+
+        let (title_heap, base) = make_shader_heap(8);
+        create_cbv(
+            std::ptr::null(),
+            &[cbv_addr as u32, (cbv_addr >> 32) as u32, 64, 0],
+            base,
+        );
+        let host_heap = heap(title_heap).host_arc().unwrap();
+        let plan = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan.bounces.len(), 1);
+        let (cpu, _, _, ref copied_at) = plan.bounces[0];
+
+        // First copy populates the bounce slice and records the watch asking.
+        plan.copy_constants();
+        let first_asking = copied_at.load(Ordering::Relaxed);
+        assert_ne!(first_asking, 0);
+        // SAFETY: bounce slice is mapped CPU-writable memory of >= 64 bytes.
+        assert_eq!(unsafe { (cpu as *const u32).read_volatile() }, 0x1122_3344);
+
+        // Second copy with no CPU writes must skip copying (asking unchanged).
+        plan.copy_constants();
+        assert_eq!(copied_at.load(Ordering::Relaxed), first_asking);
+
+        // Writing the watched page causes the next copy to pick up the new value.
+        // SAFETY: inside the 64 KiB allocation above.
+        unsafe { (cbv_addr as *mut u32).write_volatile(0x5566_7788) };
+        plan.copy_constants();
+        assert!(copied_at.load(Ordering::Relaxed) > first_asking);
+        // SAFETY: bounce slice is mapped CPU-writable memory of >= 64 bytes.
+        assert_eq!(unsafe { (cpu as *const u32).read_volatile() }, 0x5566_7788);
+
+        // Clearing slot 0 recycles its bounce slice so slot 1 reuses it.
+        // SAFETY: slot 0 is a valid 32-byte descriptor slot in `title_heap`.
+        unsafe { (base as *mut u8).write_bytes(0, 32) };
+        let _ = host_heap.bindless_plan().unwrap();
+        create_cbv(
+            std::ptr::null(),
+            &[cbv_addr as u32, (cbv_addr >> 32) as u32, 64, 0],
+            base + 32,
+        );
+        let plan2 = host_heap.bindless_plan().unwrap();
+        assert_eq!(plan2.bounces.len(), 1);
+        assert_eq!(
+            plan2.bounces[0].0, cpu,
+            "slot 1 must reuse slot 0's recycled bounce slice"
+        );
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(title_heap), 0);
+        // SAFETY: frees our `VirtualAlloc` region.
+        unsafe { VirtualFree(base_ptr as *mut _, 0, MEM_RELEASE) };
     }
 }
